@@ -1,0 +1,329 @@
+-- PS1-style affine rasterizer with per-face textures + posterized lighting + dithering
+-- With live toggles:
+--   J = toggle jittering
+--   T = toggle affine textures
+ 
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Players = game:GetService("Players")
+local player = Players.LocalPlayer
+local camera = workspace.CurrentCamera
+
+while not camera do task.wait(); camera = workspace.CurrentCamera end
+
+local sunPart = workspace:WaitForChild("Sun")
+local screenFrame = script.Parent:WaitForChild("Frame")
+screenFrame.ClipsDescendants = true
+
+-- === Config ===
+local pixelSize = 3
+local gridW, gridH
+local pixels, depthBuffer
+
+local lightLevels = 6
+
+-- === Toggles ===
+local ENABLE_JITTERING = true
+local ENABLE_AFFINE_TEX = true
+
+-- Key toggle bindings
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.KeyCode == Enum.KeyCode.J then
+        ENABLE_JITTERING = not ENABLE_JITTERING
+        warn("Jittering: " .. tostring(ENABLE_JITTERING))
+    elseif input.KeyCode == Enum.KeyCode.T then
+        ENABLE_AFFINE_TEX = not ENABLE_AFFINE_TEX
+        warn("Affine textures: " .. tostring(ENABLE_AFFINE_TEX))
+    end
+end)
+
+-- === Texture helpers ===
+local texLib = {}
+local function makeChecker(w,h,c1,c2)
+    local t = {}
+    for y=1,h do
+        t[y] = {}
+        for x=1,w do
+            t[y][x] = ((x+y)%2==0) and c1 or c2
+        end
+    end
+    return t,w,h
+end
+local function makeStripes(w,h,c1,c2)
+    local t = {}
+    for y=1,h do
+        t[y] = {}
+        for x=1,w do
+            t[y][x] = (x%2==0) and c1 or c2
+        end
+    end
+    return t,w,h
+end
+local function makeDots(w,h,c1,c2)
+    local t = {}
+    for y=1,h do
+        t[y] = {}
+        for x=1,w do
+            t[y][x] = ((x%2==1 and y%2==1) and c1) or c2
+        end
+    end
+    return t,w,h
+end
+
+texLib.checker, texLib.checkerW, texLib.checkerH = makeChecker(8,8, Color3.fromRGB(200,200,200), Color3.fromRGB(50,50,50))
+texLib.stripes, texLib.stripesW, texLib.stripesH = makeStripes(8,8, Color3.fromRGB(220,120,120), Color3.fromRGB(60,20,20))
+texLib.dots, texLib.dotsW, texLib.dotsH = makeDots(8,8, Color3.fromRGB(120,200,120), Color3.fromRGB(20,60,20))
+
+local function texObj(name, t, w, h) return {name=name, data=t, w=w, h=h} end
+local texChecker = texObj("checker", texLib.checker, texLib.checkerW, texLib.checkerH)
+local texStripes = texObj("stripes", texLib.stripes, texLib.stripesW, texLib.stripesH)
+local texDots    = texObj("dots",    texLib.dots,    texLib.dotsW,    texLib.dotsH)
+
+-- === Dithering ===
+local bayer2 = { {0,2}, {3,1} }
+local function ditherValue(val, x, y)
+    local th = bayer2[((y-1) % 2) + 1][((x-1) % 2) + 1] / 4
+    local off = (th - 0.5) / 255
+    return math.clamp(val + off, 0, 1)
+end
+local function ditherColor(c, x, y)
+    return Color3.new(ditherValue(c.R, x, y), ditherValue(c.G, x, y), ditherValue(c.B, x, y))
+end
+local function sampleTexture(tex, u, v)
+    if not tex then return Color3.new(1, 0, 1) end
+    local w, h = tex.w, tex.h
+    local t = tex.data
+    u = math.clamp(u, 0, 1)
+    v = math.clamp(v, 0, 1)
+    local sx = math.floor(u * (w - 1) + 0.5) + 1
+    local sy = math.floor(v * (h - 1) + 0.5) + 1
+    return t[sy] and t[sy][sx] or Color3.new(1, 0, 1)
+end
+
+-- === Build pixel grid ===
+local function buildGrid()
+    if pixels then
+        for yy = 1, gridH do
+            for xx = 1, gridW do
+                if pixels[yy] and pixels[yy][xx] then
+                    pixels[yy][xx]:Destroy()
+                end
+            end
+        end
+    end
+    gridW = math.max(1, math.floor(screenFrame.AbsoluteSize.X / pixelSize))
+    gridH = math.max(1, math.floor(screenFrame.AbsoluteSize.Y / pixelSize))
+    pixels, depthBuffer = {}, {}
+    for y = 1, gridH do
+        pixels[y], depthBuffer[y] = {}, {}
+        for x = 1, gridW do
+            local px = Instance.new("Frame")
+            px.BorderSizePixel = 0
+            px.BackgroundColor3 = Color3.new(0,0,0)
+            px.Size = UDim2.new(0, pixelSize, 0, pixelSize)
+            px.Position = UDim2.new(0, (x-1) * pixelSize, 0, (y-1) * pixelSize)
+            px.Parent = screenFrame
+            pixels[y][x] = px
+            depthBuffer[y][x] = math.huge
+        end
+    end
+end
+buildGrid()
+screenFrame:GetPropertyChangedSignal("AbsoluteSize"):Connect(buildGrid)
+
+-- === Geometry ===
+local function makePlane(center, sizeX, sizeZ, segX, segZ, tex)
+    local tris = {}
+    local startX, startZ = -sizeX/2, -sizeZ/2
+    local stepX, stepZ = sizeX/segX, sizeZ/segZ
+    for ix = 0, segX-1 do
+        for iz = 0, segZ-1 do
+            local x0 = startX + ix * stepX
+            local x1 = x0 + stepX
+            local z0 = startZ + iz * stepZ
+            local z1 = z0 + stepZ
+            local p1 = center + Vector3.new(x0, 0, z0)
+            local p2 = center + Vector3.new(x1, 0, z0)
+            local p3 = center + Vector3.new(x1, 0, z1)
+            local p4 = center + Vector3.new(x0, 0, z1)
+            local normal = Vector3.new(0,1,0)
+            local u0,u1 = ix/segX, (ix+1)/segX
+            local v0,v1 = iz/segZ, (iz+1)/segZ
+            table.insert(tris, {a=p1,b=p2,c=p3,aNormal=normal,bNormal=normal,cNormal=normal,
+            aUV=Vector2.new(u0,v0), bUV=Vector2.new(u1,v0), cUV=Vector2.new(u1,v1),
+            color=Color3.fromRGB(180,180,180), usesTexture=true, tex=tex})
+            table.insert(tris, {a=p1,b=p3,c=p4,aNormal=normal,bNormal=normal,cNormal=normal,
+            aUV=Vector2.new(u0,v0), bUV=Vector2.new(u1,v1), cUV=Vector2.new(u0,v1),
+            color=Color3.fromRGB(180,180,180), usesTexture=true, tex=tex})
+        end
+    end
+    return tris
+end
+
+local function makeCube(center, size, texes)
+    local half = size/2
+    local corners = {}
+    for x=-1,1,2 do for y=-1,1,2 do for z=-1,1,2 do
+        table.insert(corners, center + Vector3.new(x,y,z) * half)
+    end end end
+    local faces = {
+    {1,2,3,4, Vector3.new(0,0,1), texes[1]},
+    {5,6,7,8, Vector3.new(0,0,-1), texes[2]},
+    {1,5,7,3, Vector3.new(-1,0,0), texes[3]},
+    {2,6,8,4, Vector3.new(1,0,0), texes[4]},
+    {3,4,8,7, Vector3.new(0,1,0), texes[5]},
+    {1,2,6,5, Vector3.new(0,-1,0), texes[6]}
+    }
+    local tris = {}
+    for _,f in ipairs(faces) do
+        local i1,i2,i3,i4,nrm,tex = f[1],f[2],f[3],f[4],f[5],f[6]
+        local p1,p2,p3,p4 = corners[i1], corners[i2], corners[i3], corners[i4]
+        table.insert(tris, {a=p1,b=p2,c=p3,aNormal=nrm,bNormal=nrm,cNormal=nrm,
+        aUV=Vector2.new(0,0), bUV=Vector2.new(1,0), cUV=Vector2.new(1,1),
+        color=Color3.fromRGB(200,100,100), usesTexture=true, tex=tex})
+        table.insert(tris, {a=p1,b=p3,c=p4,aNormal=nrm,bNormal=nrm,cNormal=nrm,
+        aUV=Vector2.new(0,0), bUV=Vector2.new(1,1), cUV=Vector2.new(0,1),
+        color=Color3.fromRGB(200,100,100), usesTexture=true, tex=tex})
+    end
+    return tris
+end
+
+local function makeSphere(center, radius, latS, lonS, color)
+    local tris = {}
+    local function sph(theta,phi)
+        return Vector3.new(math.sin(theta)*math.cos(phi), math.cos(theta), math.sin(theta)*math.sin(phi)) * radius
+    end
+    for lat = 0, latS-1 do
+        local t1 = math.pi * lat / latS
+        local t2 = math.pi * (lat+1) / latS
+        for lon = 0, lonS-1 do
+            local p1 = center + sph(t1, 2*math.pi*lon / lonS)
+            local p2 = center + sph(t2, 2*math.pi*lon / lonS)
+            local p3 = center + sph(t2, 2*math.pi*(lon+1) / lonS)
+            local p4 = center + sph(t1, 2*math.pi*(lon+1) / lonS)
+            table.insert(tris, {a=p1,b=p2,c=p3,aNormal=(p1-center).Unit,bNormal=(p2-center).Unit,cNormal=(p3-center).Unit,
+            color=color, usesTexture=false})
+            table.insert(tris, {a=p1,b=p3,c=p4,aNormal=(p1-center).Unit,bNormal=(p3-center).Unit,cNormal=(p4-center).Unit,
+            color=color, usesTexture=false})
+        end
+    end
+    return tris
+end
+
+-- === Scene ===
+local scene = {}
+for _,t in ipairs(makePlane(Vector3.new(0,-5,50), 80, 80, 10, 10, texChecker)) do table.insert(scene, t) end
+for _,t in ipairs(makeCube(Vector3.new(-10,0,50), 6, {texChecker, texDots, texDots, texChecker, texStripes, texDots})) do table.insert(scene, t) end
+for _,t in ipairs(makeSphere(Vector3.new(10,5,50), 5, 6, 8, Color3.fromRGB(100,100,255))) do table.insert(scene, t) end
+
+-- === Projection (toggle jitter) ===
+local function project(v)
+    local sp, vis = camera:WorldToViewportPoint(v)
+    local gx = (sp.X / camera.ViewportSize.X) * gridW
+    local gy = (sp.Y / camera.ViewportSize.Y) * gridH
+    if ENABLE_JITTERING then
+        gx = math.floor(gx + 1)
+        gy = math.floor(gy + 1)
+    end
+    return Vector3.new(gx, gy, sp.Z), vis and sp.Z > -99
+end
+
+-- === Edge interp ===
+local function edgeInterp(A, B, y)
+    local denom = (B.p.Y - A.p.Y)
+    local t = denom == 0 and 0 or ((y - A.p.Y) / denom)
+    if t < 0 then t = 0 elseif t > 1 then t = 1 end
+    return {
+    p = A.p:Lerp(B.p, t),
+    n = (A.n:Lerp(B.n, t)).Unit,
+    v = A.v:Lerp(B.v, t),
+    uv = (A.uv and B.uv) and A.uv:Lerp(B.uv, t) or nil
+    }
+end
+
+-- === Rasterizer (toggle affine textures) ===
+local function rasterizeTri(pa, pb, pc, na, nb, nc, va, vb, vc,
+    uva, uvb, uvc, baseColor, lightPos3D, usesTexture, tex)
+    
+    local verts = {
+    {p=pa,n=na,v=va,uv=uva},
+    {p=pb,n=nb,v=vb,uv=uvb},
+    {p=pc,n=nc,v=vc,uv=uvc}
+    }
+    table.sort(verts, function(a,b) return a.p.Y < b.p.Y end)
+        
+        local function drawSpan(y, left, right)
+            local xStart = math.max(1, math.floor(left.p.X))
+            local xEnd   = math.min(gridW, math.ceil(right.p.X))
+            if xEnd < xStart then return end
+            local denomX = (right.p.X - left.p.X)
+            for x = xStart, xEnd do
+                local sampleX = x - 0.5
+                local t = (denomX == 0) and 0.5 or ((sampleX - left.p.X) / denomX)
+                if t < 0 then t = 0 elseif t > 1 then t = 1 end
+                local depth = left.p.Z + (right.p.Z - left.p.Z) * t
+                if depth < depthBuffer[y][x] then
+                    local interpNormal = (left.n:Lerp(right.n, t)).Unit
+                    local interpPos    = left.v:Lerp(right.v, t)
+                    local color = baseColor
+                    if ENABLE_AFFINE_TEX and usesTexture and left.uv and right.uv then
+                        local uv = left.uv:Lerp(right.uv, t)
+                        color = sampleTexture(tex, uv.X, uv.Y)
+                    end
+                    local lightVec = (interpPos - lightPos3D)
+                    local lightDir = (lightVec.Magnitude > 0) and lightVec.Unit or Vector3.new(0,0,1)
+                    local brightness = math.clamp(-interpNormal:Dot(lightDir), 0, 1)
+                    local quant = math.floor(brightness * lightLevels + 0.5) / math.max(1, lightLevels)
+                    local shaded = Color3.new(color.R * quant, color.G * quant, color.B * quant)
+                    local dcol = ditherColor(shaded, x, y)
+                    pixels[y][x].BackgroundColor3 = dcol
+                    depthBuffer[y][x] = depth
+                end
+            end
+        end
+        
+        local vTop, vMid, vBot = verts[1], verts[2], verts[3]
+        for y = math.floor(vTop.p.Y), math.floor(vMid.p.Y) do
+            if y >= 1 and y <= gridH then
+                local left = edgeInterp(vTop, vBot, y)
+                local right = edgeInterp(vTop, vMid, y)
+                if left.p.X > right.p.X then left,right = right,left end
+                drawSpan(y,left,right)
+            end
+        end
+        for y = math.floor(vMid.p.Y), math.floor(vBot.p.Y) do
+            if y >= 1 and y <= gridH then
+                local left = edgeInterp(vTop, vBot, y)
+                local right = edgeInterp(vMid, vBot, y)
+                if left.p.X > right.p.X then left,right = right,left end
+                drawSpan(y,left,right)
+            end
+        end
+    end
+    
+    -- === Render loop ===
+    RunService.RenderStepped:Connect(function()
+        if not pixels then return end
+        for y = 1, gridH do
+            for x = 1, gridW do
+                pixels[y][x].BackgroundColor3 = Color3.new(0,0,0)
+                depthBuffer[y][x] = math.huge
+            end
+        end
+        local lightPos = sunPart.Position
+        for _, tri in ipairs(scene) do
+            local pa, va = project(tri.a)
+            local pb, vb = project(tri.b)
+            local pc, vc = project(tri.c)
+            if va and vb and vc then
+                rasterizeTri(pa, pb, pc,
+                tri.aNormal, tri.bNormal, tri.cNormal,
+                tri.a, tri.b, tri.c,
+                tri.aUV, tri.bUV, tri.cUV,
+                tri.color, lightPos,
+                tri.usesTexture, tri.tex)
+            end
+        end
+    end)
+    
